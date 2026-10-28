@@ -1,0 +1,494 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p wallpaper-widget
+          cd wallpaper-widget
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'WWEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.wallpaperwidget"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.wallpaperwidget"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.1")
+          }
+          WWEOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'WWEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SET_WALLPAPER" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".WallpaperWidgetProvider"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/wallpaper_widget_info" />
+                  </receiver>
+
+              </application>
+          </manifest>
+          WWEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/wallpaperwidget/MainActivity.kt')"
+          cat > 'app/src/main/java/com/example/wallpaperwidget/MainActivity.kt' <<'WWEOF'
+          package com.example.wallpaperwidget
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import kotlin.concurrent.thread
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var status: TextView
+
+              private val picker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                  if (uris.isNullOrEmpty()) return@registerForActivityResult
+                  uris.forEach {
+                      try {
+                          contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      } catch (e: SecurityException) {
+                      }
+                  }
+                  Playlist.add(this, uris)
+                  refresh()
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+
+                  status = TextView(this).apply { textSize = 18f; gravity = Gravity.CENTER }
+                  root.addView(status)
+
+                  fun button(textRes: Int, onClick: () -> Unit) = Button(this).apply {
+                      setText(textRes)
+                      setOnClickListener { onClick() }
+                      root.addView(this)
+                  }
+
+                  button(R.string.add_images) { picker.launch(arrayOf("image/*")) }
+                  button(R.string.prev) { step(-1) }
+                  button(R.string.next) { step(1) }
+                  button(R.string.clear) {
+                      Playlist.clear(this)
+                      refresh()
+                  }
+
+                  TextView(this).apply {
+                      setText(R.string.hint)
+                      textSize = 14f
+                      setPadding(0, pad, 0, 0)
+                      root.addView(this)
+                  }
+
+                  setContentView(root)
+                  refresh()
+              }
+
+              private fun step(delta: Int) {
+                  if (Playlist.size(this) == 0) {
+                      Toast.makeText(this, R.string.widget_empty, Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  thread {
+                      val uri: Uri? = Playlist.step(this, delta)
+                      val ok = uri != null && WallpaperApplier.apply(this, uri)
+                      runOnUiThread {
+                          if (!ok) Toast.makeText(this, R.string.apply_failed, Toast.LENGTH_SHORT).show()
+                          refresh()
+                      }
+                  }
+              }
+
+              private fun refresh() {
+                  val n = Playlist.size(this)
+                  status.text = if (n == 0) getString(R.string.widget_empty)
+                  else getString(R.string.status_fmt, Playlist.index(this) + 1, n)
+                  WallpaperWidgetProvider.refreshAll(this)
+              }
+          }
+          WWEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/wallpaperwidget/Playlist.kt')"
+          cat > 'app/src/main/java/com/example/wallpaperwidget/Playlist.kt' <<'WWEOF'
+          package com.example.wallpaperwidget
+
+          import android.content.Context
+          import android.net.Uri
+          import org.json.JSONArray
+
+          /** 播放列表：保存图片 URI 和当前位置，数据存在 SharedPreferences 里。 */
+          object Playlist {
+              private const val PREFS = "playlist"
+              private const val KEY_URIS = "uris"
+              private const val KEY_INDEX = "index"
+
+              private fun prefs(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+              fun items(c: Context): List<Uri> {
+                  val json = prefs(c).getString(KEY_URIS, "[]") ?: "[]"
+                  val arr = JSONArray(json)
+                  return List(arr.length()) { Uri.parse(arr.getString(it)) }
+              }
+
+              fun size(c: Context) = items(c).size
+
+              fun index(c: Context): Int {
+                  val n = size(c)
+                  if (n == 0) return 0
+                  return prefs(c).getInt(KEY_INDEX, 0).coerceIn(0, n - 1)
+              }
+
+              fun add(c: Context, uris: List<Uri>) {
+                  val merged = (items(c) + uris).distinct()
+                  save(c, merged)
+              }
+
+              fun clear(c: Context) {
+                  save(c, emptyList())
+                  prefs(c).edit().putInt(KEY_INDEX, 0).apply()
+              }
+
+              fun setIndex(c: Context, i: Int) {
+                  prefs(c).edit().putInt(KEY_INDEX, i).apply()
+              }
+
+              /** 移动到下一张/上一张（循环），返回新的 URI；列表为空返回 null。 */
+              fun step(c: Context, delta: Int): Uri? {
+                  val list = items(c)
+                  if (list.isEmpty()) return null
+                  val n = list.size
+                  val next = ((index(c) + delta) % n + n) % n
+                  setIndex(c, next)
+                  return list[next]
+              }
+
+              fun current(c: Context): Uri? = items(c).getOrNull(index(c))
+
+              private fun save(c: Context, list: List<Uri>) {
+                  val arr = JSONArray()
+                  list.forEach { arr.put(it.toString()) }
+                  prefs(c).edit().putString(KEY_URIS, arr.toString()).apply()
+              }
+          }
+          WWEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/wallpaperwidget/WallpaperApplier.kt')"
+          cat > 'app/src/main/java/com/example/wallpaperwidget/WallpaperApplier.kt' <<'WWEOF'
+          package com.example.wallpaperwidget
+
+          import android.app.WallpaperManager
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.net.Uri
+
+          /** 把一张图片设置为系统壁纸（主屏 + 锁屏）。需在后台线程调用。 */
+          object WallpaperApplier {
+
+              fun apply(c: Context, uri: Uri): Boolean {
+                  return try {
+                      val bmp = decode(c, uri) ?: return false
+                      val wm = WallpaperManager.getInstance(c)
+                      wm.setBitmap(bmp, null, true, WallpaperManager.FLAG_SYSTEM or WallpaperManager.FLAG_LOCK)
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              /** 按屏幕大小缩放解码，避免大图撑爆内存。 */
+              private fun decode(c: Context, uri: Uri): Bitmap? {
+                  val dm = c.resources.displayMetrics
+                  val targetW = maxOf(dm.widthPixels, dm.heightPixels)
+                  val targetH = targetW
+
+                  val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  c.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                  if (bounds.outWidth <= 0) return null
+
+                  var sample = 1
+                  while (bounds.outWidth / (sample * 2) >= targetW && bounds.outHeight / (sample * 2) >= targetH) {
+                      sample *= 2
+                  }
+                  val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                  return c.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+              }
+          }
+          WWEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/wallpaperwidget/WallpaperWidgetProvider.kt')"
+          cat > 'app/src/main/java/com/example/wallpaperwidget/WallpaperWidgetProvider.kt' <<'WWEOF'
+          package com.example.wallpaperwidget
+
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.widget.RemoteViews
+          import kotlin.concurrent.thread
+
+          class WallpaperWidgetProvider : AppWidgetProvider() {
+
+              override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
+                  ids.forEach { manager.updateAppWidget(it, buildViews(context)) }
+              }
+
+              override fun onReceive(context: Context, intent: Intent) {
+                  super.onReceive(context, intent)
+                  val delta = when (intent.action) {
+                      ACTION_PREV -> -1
+                      ACTION_NEXT -> 1
+                      else -> return
+                  }
+                  val pending = goAsync()
+                  thread {
+                      try {
+                          val uri = Playlist.step(context, delta)
+                          if (uri != null) WallpaperApplier.apply(context, uri)
+                      } finally {
+                          refreshAll(context)
+                          pending.finish()
+                      }
+                  }
+              }
+
+              companion object {
+                  const val ACTION_PREV = "com.example.wallpaperwidget.PREV"
+                  const val ACTION_NEXT = "com.example.wallpaperwidget.NEXT"
+
+                  fun refreshAll(context: Context) {
+                      val mgr = AppWidgetManager.getInstance(context)
+                      val ids = mgr.getAppWidgetIds(ComponentName(context, WallpaperWidgetProvider::class.java))
+                      ids.forEach { mgr.updateAppWidget(it, buildViews(context)) }
+                  }
+
+                  private fun buildViews(context: Context): RemoteViews {
+                      val views = RemoteViews(context.packageName, R.layout.widget_wallpaper)
+                      val n = Playlist.size(context)
+                      val label = if (n == 0) context.getString(R.string.widget_empty)
+                      else "${Playlist.index(context) + 1} / $n"
+                      views.setTextViewText(R.id.widget_counter, label)
+                      views.setOnClickPendingIntent(R.id.widget_prev, actionIntent(context, ACTION_PREV, 1))
+                      views.setOnClickPendingIntent(R.id.widget_next, actionIntent(context, ACTION_NEXT, 2))
+                      val open = PendingIntent.getActivity(
+                          context, 3, Intent(context, MainActivity::class.java),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      views.setOnClickPendingIntent(R.id.widget_counter, open)
+                      return views
+                  }
+
+                  private fun actionIntent(context: Context, action: String, code: Int): PendingIntent {
+                      val intent = Intent(context, WallpaperWidgetProvider::class.java).setAction(action)
+                      return PendingIntent.getBroadcast(
+                          context, code, intent,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                  }
+              }
+          }
+          WWEOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/widget_bg.xml')"
+          cat > 'app/src/main/res/drawable/widget_bg.xml' <<'WWEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android">
+              <solid android:color="#99000000" />
+              <corners android:radius="20dp" />
+          </shape>
+          WWEOF
+          mkdir -p "$(dirname 'app/src/main/res/layout/widget_wallpaper.xml')"
+          cat > 'app/src/main/res/layout/widget_wallpaper.xml' <<'WWEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/widget_bg"
+              android:gravity="center_vertical"
+              android:orientation="horizontal"
+              android:padding="8dp">
+
+              <Button
+                  android:id="@+id/widget_prev"
+                  android:layout_width="0dp"
+                  android:layout_height="match_parent"
+                  android:layout_weight="1"
+                  android:text="@string/prev" />
+
+              <TextView
+                  android:id="@+id/widget_counter"
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_weight="1"
+                  android:gravity="center"
+                  android:textColor="#FFFFFF"
+                  android:textSize="16sp" />
+
+              <Button
+                  android:id="@+id/widget_next"
+                  android:layout_width="0dp"
+                  android:layout_height="match_parent"
+                  android:layout_weight="1"
+                  android:text="@string/next" />
+          </LinearLayout>
+          WWEOF
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'WWEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">壁纸切换</string>
+              <string name="prev">◀ 上一张</string>
+              <string name="next">下一张 ▶</string>
+              <string name="add_images">添加图片到播放列表</string>
+              <string name="clear">清空播放列表</string>
+              <string name="widget_empty">播放列表为空</string>
+              <string name="status_fmt">当前第 %1$d 张，共 %2$d 张</string>
+              <string name="apply_failed">设置壁纸失败，图片可能已被移动或删除</string>
+              <string name="hint">使用方法：先在这里添加图片，然后长按平板桌面 → 小组件 → 找到“壁纸切换”拖到桌面，之后点“上一张/下一张”即可切换壁纸。</string>
+          </resources>
+          WWEOF
+          mkdir -p "$(dirname 'app/src/main/res/xml/wallpaper_widget_info.xml')"
+          cat > 'app/src/main/res/xml/wallpaper_widget_info.xml' <<'WWEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:initialLayout="@layout/widget_wallpaper"
+              android:minWidth="250dp"
+              android:minHeight="60dp"
+              android:resizeMode="horizontal|vertical"
+              android:updatePeriodMillis="0"
+              android:widgetCategory="home_screen" />
+          WWEOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'WWEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          WWEOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'WWEOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          WWEOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'WWEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WallpaperWidget"
+          include(":app")
+          WWEOF
+
+      - name: Build debug APK
+        working-directory: wallpaper-widget
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallpaper-widget-apk
+          path: wallpaper-widget/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Wallpaper Widget build ${{ github.run_number }}
+          files: wallpaper-widget/app/build/outputs/apk/debug/app-debug.apk
